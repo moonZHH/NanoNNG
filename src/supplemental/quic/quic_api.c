@@ -427,13 +427,25 @@ quic_connection_cb(_In_ HQUIC Connection, _In_opt_ void *Context,
 		// the connection.
 		if (Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status ==
 		    QUIC_STATUS_CONNECTION_IDLE) {
-			log_warn("[conn][%p] Successfully shut down on idle.\n",
+			log_warn(
+			    "[conn][%p] Successfully shut down on idle.\n",
+			    qconn);
+		} else if (Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status ==
+		    QUIC_STATUS_CONNECTION_TIMEOUT) {
+			log_warn("[conn][%p] Successfully shut down on "
+			         "CONNECTION_TIMEOUT.\n",
 			    qconn);
 		} else {
-			log_warn("[conn][%p] Shut down by transport, 0x%x, Error Code %llu\n",
-			    qconn, Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status,
-				(unsigned long long) Event->SHUTDOWN_INITIATED_BY_TRANSPORT.ErrorCode);
+			log_error(
+			    "[conn][%p] Shut down by transport, status 0x%x\n",
+			    qconn,
+			    Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status);
 		}
+		log_warn(
+		    "[conn][%p] Shut down by transport, Error Code: %llu\n",
+		    qconn,
+		    (unsigned long long)
+		        Event->SHUTDOWN_INITIATED_BY_TRANSPORT.ErrorCode);
 		break;
 	case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
 		// The connection was explicitly shut down by the peer.
@@ -444,7 +456,7 @@ quic_connection_cb(_In_ HQUIC Connection, _In_opt_ void *Context,
 		// The connection has completed the shutdown process and is
 		// ready to be safely cleaned up.
 		log_info("[conn][%p] QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE: All done\n\n", qconn);
-		nni_mtx_lock(&qsock->mtx);
+
 		if (!Event->SHUTDOWN_COMPLETE.AppCloseInProgress) {
 			MsQuic->ConnectionClose(qconn);
 		}
@@ -455,6 +467,7 @@ quic_connection_cb(_In_ HQUIC Connection, _In_opt_ void *Context,
 			pipe_ops->pipe_stop(qsock->pipe);
 			pipe_ops->pipe_close(qsock->pipe);
 			pipe_ops->pipe_fini(qsock->pipe);
+			nni_mtx_lock(&qsock->mtx);
 			nng_free(qsock->pipe, 0);
 			qsock->pipe = NULL;
 
@@ -463,9 +476,8 @@ quic_connection_cb(_In_ HQUIC Connection, _In_opt_ void *Context,
 				nni_mtx_unlock(&qsock->mtx);
 				break;
 			}
+			nni_mtx_unlock(&qsock->mtx);
 		}
-
-		nni_mtx_unlock(&qsock->mtx);
 		nni_aio_finish(&qsock->close_aio, 0, 0);
 		/*
 		if (qstrm->rtt0_enable) {
@@ -503,14 +515,21 @@ quic_connection_cb(_In_ HQUIC Connection, _In_opt_ void *Context,
 }
 
 int
-quic_disconnect(void *qsock)
+quic_disconnect(void *qsock, void *qpipe)
 {
 	log_debug("actively disclose the QUIC stream");
 	quic_sock_t *qs = qsock;
+	quic_strm_t *qstrm = qpipe;
 	if (!qsock) {
 		return -1;
 	}
 
+	if (qstrm->closed == true || qstrm->stream != NULL) {
+		return -1;
+	}
+	MsQuic->StreamClose(qstrm->stream);
+	MsQuic->StreamShutdown(
+	    qstrm->stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, NNG_ECONNSHUT);
 	MsQuic->ConnectionShutdown(
 	    qs->qconn, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, NNG_ECLOSED);
 	return 0;
@@ -678,15 +697,17 @@ quic_pipe_send_start(quic_strm_t *qstrm)
 	nni_msg    *msg;
 	QUIC_STATUS rv;
 
-	if (qstrm->closed) {
-		while ((aio = nni_list_first(&qstrm->sendq)) != NULL) {
-			nni_list_remove(&qstrm->sendq, aio);
-			nni_aio_finish_error(aio, NNG_ECLOSED);
-		}
+	if ((aio = nni_list_first(&qstrm->sendq)) == NULL) {
 		return;
 	}
 
-	if ((aio = nni_list_first(&qstrm->sendq)) == NULL) {
+	if (qstrm->closed) {
+		while ((aio = nni_list_first(&qstrm->sendq)) != NULL) {
+			msg = nni_aio_get_msg(aio);
+			nni_msg_free(msg);
+			nni_list_remove(&qstrm->sendq, aio);
+			nni_aio_finish_error(aio, NNG_ECLOSED);
+		}
 		return;
 	}
 
@@ -1011,12 +1032,20 @@ quic_pipe_send(void *qpipe, nni_aio *aio)
 {
 	quic_strm_t *qstrm = qpipe;
 	int          rv;
+	nni_msg     *msg;
 
 	if ((rv = nni_aio_begin(aio)) != 0) {
 		return rv;
 	}
 
 	nni_mtx_lock(&qstrm->mtx);
+	if (qstrm->closed) {
+		msg = nni_aio_get_msg(aio);
+		nni_msg_free(msg);
+		nni_aio_finish_error(aio, NNG_ECLOSED);
+		return -1;
+	}
+
 	if ((rv = nni_aio_schedule(aio, quic_pipe_send_cancel, qstrm)) != 0) {
 		nni_mtx_unlock(&qstrm->mtx);
 		nni_aio_finish_error(aio, rv);
